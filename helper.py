@@ -1,6 +1,8 @@
+
 import sys
 import numpy as np
-import scrappy
+import random as rm
+#import scrappy
 from uuid import uuid4
 import scipy.stats as st
 import subprocess
@@ -8,12 +10,12 @@ from fast5_research import Fast5
 import distance
 import math
 import json
-import binascii 
+import binascii
 import struct
 import os
 import crc8
 import filecmp
-import h5py
+#import h5py
 import shutil
 
 REPO_PATH = os.path.dirname(os.path.realpath(__file__))+'/'
@@ -31,6 +33,54 @@ prp_b = 2532
 prp_a_inv = 3303 # calculated using util.modinv in dna_storage
 index_len = 12
 crc_len = 8
+
+
+
+def encode_with_crc(payload_bits):
+    """
+    Takes a random binary list (as string) and encodes it with random index and CRC.
+
+    Args:
+        payload_bits (str): Binary string of payload data (e.g., "10110011101...")
+
+    Returns:
+        str: Complete encoded bit string ready for convolutional encoding
+    """
+    # Generate random index between 0 and 500
+    index = rm.randint(0, 4096)
+
+    # Encrypt index using pseudorandom permutation
+    index_prp = (prp_a * index + prp_b) % (2**index_len)
+    bin_index_string = bin(index_prp)[2:].zfill(index_len)
+
+    # Convert index to bytes
+    index_bytes = bytearray()
+    padded_index = bin_index_string.zfill(8 * math.ceil(index_len/8))
+    for i in range(0, len(padded_index), 8):
+        byte_chunk = padded_index[i:i+8]
+        index_bytes.append(int(byte_chunk, 2))
+    index_bytes = bytes(index_bytes)
+
+    # Convert payload bits to bytes
+    payload_bytes = bytearray()
+    # Pad payload to byte boundary
+    padded_payload = payload_bits.ljust(8 * math.ceil(len(payload_bits)/8), '0')
+    for i in range(0, len(padded_payload), 8):
+        byte_chunk = padded_payload[i:i+8]
+        payload_bytes.append(int(byte_chunk, 2))
+    payload_bytes = bytes(payload_bytes)
+
+    # Calculate CRC over index_bytes + payload_bytes
+    crc = crc8.crc8(index_bytes + payload_bytes)
+    crc_bytes = crc.digest()
+
+    # Convert CRC to bit string
+    crc_bit_string = ''.join(format(byte, '08b') for byte in crc_bytes)
+
+    # Combine: [encrypted_index][payload][crc]
+    complete_bit_string = bin_index_string + payload_bits + crc_bit_string
+
+    return complete_bit_string
 
 def simulate_indelsubs(read, sub_prob = 0.0, del_prob = 0.0, ins_prob = 0.0):
     '''
@@ -52,7 +102,7 @@ def simulate_indelsubs(read, sub_prob = 0.0, del_prob = 0.0, ins_prob = 0.0):
         else:
             if pos_in_char_list == len(char_list):# end of original read and not inserting
                 break
-            _del = (np.random.random_sample()<del_prob) 
+            _del = (np.random.random_sample()<del_prob)
             if _del:
                 pos_in_char_list += 1
             else:
@@ -68,8 +118,8 @@ def simulate_indelsubs(read, sub_prob = 0.0, del_prob = 0.0, ins_prob = 0.0):
 def rep_rvs(size,a):
     a = a*5
     array_1 = np.ones(int(size*(0.075-0.015*a))).astype(int)
-    samples = st.alpha.rvs(3.3928495261646932+a, 
-        -7.6451557771999035+(2*a), 50.873948369526737, 
+    samples = st.alpha.rvs(3.3928495261646932+a,
+        -7.6451557771999035+(2*a), 50.873948369526737,
         size=(size-int(size*(0.075-0.015*a)))).astype(int)
     samples = np.concatenate((samples, array_1), 0)
     samples[samples<1] = 2
@@ -89,7 +139,7 @@ def create_fast5(raw_data, fast5_filename):
         raw_data_binned = raw_data
     else:
         raw_data_binned = np.digitize(raw_data, bins).astype(np.int16)
-    
+
     # The following are required meta data
     channel_id = {
         'digitisation': digitisation,
@@ -144,7 +194,7 @@ def read_seq(infile_seq):
     f = open(infile_seq)
     seq = f.readline().rstrip('\n')
     if seq[0] == '>':
-        seq = f.readline().rstrip('\n') 
+        seq = f.readline().rstrip('\n')
     f.close()
     len_seq = len(seq)
     print('Length of seq: ', len_seq)
@@ -156,13 +206,15 @@ def find_barcode_pos_in_post(trans_filename,fastq_filename,start_barcode,end_bar
     find position of best edit distance match for barcodes in the post matrix
     looks at fastq to find the best match for barcode_start and barcode_end and then finds
     corresponding entries in trans_filename. Returns a tuple (start_pos,end_pos) which represents
-    start and end position of actual payload in the post matrix (both inclusive, zero-indexed). 
-    One could then slightly extend these or not, depending on what works best. 
+    start and end position of actual payload in the post matrix (both inclusive, zero-indexed).
+    One could then slightly extend these or not, depending on what works best.
     If things fail, return (-1,-1)
     extend_len: extra length at start and end to search for barcode match (useful if basecaller cuts
     a bit of the barcode, e.g., with guppy)
     extend_penalty: float between 0.0 and 1.0 telling the penalty we impose per base on extend operation (i.e., barcode hanging off the sides). Setting to 1 just means we compute edit distance as it is (this can penalize a bit much and miss perfect match of say 10 bases out of 25 base barcode). Setting to 0 is bad because then there is chance that the empty match (completely hanging off) is selected.
     '''
+    # start_pos and end_pos are the indices in the post matrix that define the payload.
+    # start_bc_min_dist and end_bc_min_dist represent the quality of the match for start_barcode and end_barcode, respectively, as edit distances.
     assert extend_len >= 0
     assert 0.0 <= extend_penalty <= 1.0
     one_minus_extend_penalty = 1.0-extend_penalty
@@ -174,7 +226,7 @@ def find_barcode_pos_in_post(trans_filename,fastq_filename,start_barcode,end_bar
     # load entries in trans_filename
     with open(trans_filename,'r') as f:
         trans_arr = [int(l.rstrip('\n')) for l in f.readlines()]
-    
+
     start_barcode_len = len(start_barcode)
     end_barcode_len = len(end_barcode)
     if start_barcode_len + end_barcode_len > basecall_len:
@@ -192,7 +244,7 @@ def find_barcode_pos_in_post(trans_filename,fastq_filename,start_barcode,end_bar
     start_bc_last_base = start_bc_first_base + start_barcode_len - 1
 
     end_bc_edit_distance = []
-    for i in range(start_bc_last_base,basecall_len-end_barcode_len+1): # end_bc must be after start_bc 
+    for i in range(start_bc_last_base,basecall_len-end_barcode_len+1): # end_bc must be after start_bc
         end_bc_edit_distance.append(distance.levenshtein(end_barcode,basecall[i:i+end_barcode_len]))
     for i in range(1,extend_len+1):
         end_bc_edit_distance.append(distance.levenshtein(end_barcode,basecall[basecall_len-end_barcode_len+i:basecall_len])-i*one_minus_extend_penalty)
@@ -203,15 +255,15 @@ def find_barcode_pos_in_post(trans_filename,fastq_filename,start_barcode,end_bar
       end_bc_first_base = basecall_len-end_barcode_len + 1 + end_bc_edit_distance.index(min(end_bc_edit_distance))
     else:
       end_bc_first_base = start_bc_last_base+end_bc_edit_distance.index(min(end_bc_edit_distance))
-    print('basecall_len', basecall_len)
+    #print('basecall_len', basecall_len)
     print('start_bc_last_base', start_bc_last_base)
     print('end_bc_first_base', end_bc_first_base)
-    
+
     start_pos = trans_arr[start_bc_last_base+1]-1
     end_pos = trans_arr[end_bc_first_base-1]-1
     print('start_pos_in_post',start_pos)
     print('end_pos_in_post',end_pos)
-    print('basecall',basecall)
+    #print('basecall',basecall)
     print('start_barcode',start_barcode)
     print('start_bcmatch',basecall[max(0,start_bc_first_base):start_bc_first_base+start_barcode_len])
     print('end_barcode',end_barcode)
@@ -222,9 +274,83 @@ def find_barcode_pos_in_post(trans_filename,fastq_filename,start_barcode,end_bar
         return (-1,-1,np.inf,np.inf)
     return (start_pos,end_pos,min(start_bc_edit_distance),min(end_bc_edit_distance))
 
+def find_barcode_pos_in_post_ps(trans_filename,fastq_filename,start_barcode,end_barcode,extend_len=0, extend_penalty=1.0):
+    '''
+    find position of best edit distance match for barcodes in the post matrix
+    looks at fastq to find the best match for barcode_start and barcode_end and then finds
+    corresponding entries in trans_filename. Returns a tuple (start_pos,end_pos) which represents
+    start and end position of actual payload in the post matrix (both inclusive, zero-indexed).
+    One could then slightly extend these or not, depending on what works best.
+    If things fail, return (-1,-1)
+    extend_len: extra length at start and end to search for barcode match (useful if basecaller cuts
+    a bit of the barcode, e.g., with guppy)
+    extend_penalty: float between 0.0 and 1.0 telling the penalty we impose per base on extend operation (i.e., barcode hanging off the sides). Setting to 1 just means we compute edit distance as it is (this can penalize a bit much and miss perfect match of say 10 bases out of 25 base barcode). Setting to 0 is bad because then there is chance that the empty match (completely hanging off) is selected.
+    '''
+    # start_pos and end_pos are the indices in the post matrix that define the payload.
+    # start_bc_min_dist and end_bc_min_dist represent the quality of the match for start_barcode and end_barcode, respectively, as edit distances.
+    assert extend_len >= 0
+    assert 0.0 <= extend_penalty <= 1.0
+    one_minus_extend_penalty = 1.0-extend_penalty
+    # load basecalled read from fastq
+    with open(fastq_filename,'r') as f:
+        _ = f.readline()
+        basecall = f.readline().rstrip('\n')
+    basecall_len = len(basecall)
+    # load entries in trans_filename
+    with open(trans_filename,'r') as f:
+        trans_arr = [int(l.rstrip('\n')) for l in f.readlines()]
+
+    start_barcode_len = len(start_barcode)
+    end_barcode_len = len(end_barcode)
+    if start_barcode_len + end_barcode_len > basecall_len:
+        #print('Too short read')
+        return (-1,-1,np.inf,np.inf)
+
+    start_bc_edit_distance = []
+    for i in range(-extend_len,0):
+        start_bc_edit_distance.append(distance.levenshtein(start_barcode,basecall[:start_barcode_len+i])+i*one_minus_extend_penalty)
+    for i in range(basecall_len-start_barcode_len):
+        start_bc_edit_distance.append(distance.levenshtein(start_barcode,basecall[i:i+start_barcode_len]))
+
+    # find best match positions
+    start_bc_first_base = start_bc_edit_distance.index(min(start_bc_edit_distance))-extend_len
+    start_bc_last_base = start_bc_first_base + start_barcode_len - 1
+
+    end_bc_edit_distance = []
+    for i in range(start_bc_last_base,basecall_len-end_barcode_len+1): # end_bc must be after start_bc
+        end_bc_edit_distance.append(distance.levenshtein(end_barcode,basecall[i:i+end_barcode_len]))
+    for i in range(1,extend_len+1):
+        end_bc_edit_distance.append(distance.levenshtein(end_barcode,basecall[basecall_len-end_barcode_len+i:basecall_len])-i*one_minus_extend_penalty)
+
+    # find best match positions
+    # need sanity check in case range(start_bc_last_base,basecall_len-end_barcode_len) is empty
+    if start_bc_last_base >= basecall_len-end_barcode_len:
+      end_bc_first_base = basecall_len-end_barcode_len + 1 + end_bc_edit_distance.index(min(end_bc_edit_distance))
+    else:
+      end_bc_first_base = start_bc_last_base+end_bc_edit_distance.index(min(end_bc_edit_distance))
+    #print('basecall_len', basecall_len)
+    #print('start_bc_last_base', start_bc_last_base)
+    #print('end_bc_first_base', end_bc_first_base)
+
+    start_pos = trans_arr[start_bc_first_base+1]-1
+    end_pos = trans_arr[end_bc_first_base-1]-1
+    #print('start_pos_in_post',start_pos)
+    #print('end_pos_in_post',end_pos)
+    #print('basecall',basecall)
+    #print('start_barcode',start_barcode)
+    #print('start_bcmatch',basecall[max(0,start_bc_first_base):start_bc_first_base+start_barcode_len])
+    #print('end_barcode',end_barcode)
+    #print('end_bcmatch',basecall[end_bc_first_base:end_bc_first_base+end_barcode_len])
+
+    if end_pos < start_pos:
+        #print('Barcode removal failure')
+        return (-1,-1,np.inf,np.inf)
+    return (start_pos,end_pos,min(start_bc_edit_distance),min(end_bc_edit_distance))
+
+
 def truncate_post_file(old_post_filename, new_post_filename, start_pos, end_pos, bytes_per_blk = 20):
     '''
-    Truncate post file to [start_pos,end_pos] and write to new_post_filename. 
+    Truncate post file to [start_pos,end_pos] and write to new_post_filename.
     bytes_per_blk is 20 by default
     20 = sizeof(float)*5 (5 entries in CTC posterior per timestep for bonito)
     '''
@@ -255,7 +381,7 @@ def encode(data_file, oligo_file, bytes_per_oligo, RS_redundancy, conv_m, conv_r
 
     with open(data_file,'rb') as f:
         data = f.read()
-    
+
     # pad data to multiple of bytes_per_oligo
     data_size = len(data)
     data_size_padded = math.ceil(data_size/bytes_per_oligo)*bytes_per_oligo
@@ -276,26 +402,26 @@ def encode(data_file, oligo_file, bytes_per_oligo, RS_redundancy, conv_m, conv_r
             if pad:
                 bit_string_oligo = bit_string_oligo + '0'
             f.write(bit_string_oligo + '\n')
-    
+
     # apply convolutional encoding to each oligo
     subprocess.run([PATH_TO_VITERBI_NANOPORE,'-m', 'encode','-i',conv_input_file,'-o',oligo_file,'--mem-conv',str(conv_m),'--msg-len',str(msg_len),'-r',str(conv_r)])
-    
+
     with open(oligo_file) as f:
         oligo_len = len(f.readline().rstrip('\n'))
         print('oligo_len',oligo_len)
     print('writing rate (bits per base):', data_size*8/(oligo_len*num_oligos))
-    return 
+    return
 
 
 def rotate_left(input_str, rot_val):
     rot_val = rot_val % len(input_str)
-    out1 = input_str[rot_val:] 
+    out1 = input_str[rot_val:]
     out2 = input_str[:rot_val]
     return out1+out2
 
 def rotate_right(input_str, rot_val):
     rot_val = rot_val % len(input_str)
-    out1 = input_str[-rot_val:] 
+    out1 = input_str[-rot_val:]
     out2 = input_str[:-rot_val]
     return out1+out2
 
@@ -313,7 +439,7 @@ def encode_2crc(data_file, oligo_file, bytes_per_oligo, RS_redundancy, conv_m, c
 
     with open(data_file,'rb') as f:
         data = f.read()
-    
+
     # pad data to multiple of bytes_per_oligo
     data_size = len(data)
     data_size_padded = math.ceil(data_size/bytes_per_oligo)*bytes_per_oligo
@@ -333,7 +459,7 @@ def encode_2crc(data_file, oligo_file, bytes_per_oligo, RS_redundancy, conv_m, c
 
             # Rotate the oligo
             # RS code operates on 2 bytes at a time, so the shift is proportional
-            oligo = rotate_left(oligo, index_prp*2) 
+            oligo = rotate_left(oligo, index_prp*2)
 
             # Generate 2 CRCs with first half and second half of the oligo
             oligo_len = len(oligo)
@@ -345,25 +471,25 @@ def encode_2crc(data_file, oligo_file, bytes_per_oligo, RS_redundancy, conv_m, c
             if pad:
                 bit_string_oligo = bit_string_oligo + '0'
             f.write(bit_string_oligo + '\n')
-    
+
     # apply convolutional encoding to each oligo
     print('msg_len',msg_len)
     print('conv_m',conv_m)
     print('conv_r',conv_r)
     print('conv_input_file',conv_input_file)
     subprocess.run([PATH_TO_VITERBI_NANOPORE,'-m', 'encode','-i',conv_input_file,'-o',oligo_file,'--mem-conv',str(conv_m),'--msg-len',str(msg_len),'-r',str(conv_r)])
-    
+
     with open(oligo_file) as f:
         oligo_len = len(f.readline().rstrip('\n'))
         print('oligo_len',oligo_len)
     print('writing rate (bits per base):', data_size*8/(oligo_len*num_oligos))
-    return 
+    return
 
 def compute_parameters(bytes_per_oligo, RS_redundancy, data_size_padded, pad):
     msg_len = index_len + crc_len + 8*bytes_per_oligo + pad
     assert data_size_padded%bytes_per_oligo == 0
-    num_oligos_data = data_size_padded//bytes_per_oligo 
-    num_oligos_RS = int(num_oligos_data*RS_redundancy) 
+    num_oligos_data = data_size_padded//bytes_per_oligo
+    num_oligos_RS = int(num_oligos_data*RS_redundancy)
     num_oligos = num_oligos_data + num_oligos_RS
     print('msg_len', msg_len)
     print('num_oligos_data',num_oligos_data)
@@ -372,6 +498,21 @@ def compute_parameters(bytes_per_oligo, RS_redundancy, data_size_padded, pad):
     return (msg_len, num_oligos_data, num_oligos_RS, num_oligos)
 
 def bitstring2bytestring(bitstring, bitstring_len):
+    r"""
+    hex_string = hex(int(bitstring, 2))[2:]  # Remove '0x' prefix
+
+    # Calculate required hex length (each byte = 2 hex chars)
+    required_hex_len = bitstring_len // 4
+
+    # Ensure even length by padding to required length
+    hex_string = hex_string.zfill(required_hex_len)
+
+    # If still odd (shouldn't happen with correct bitstring_len), pad with leading zero
+    if len(hex_string) % 2 == 1:
+        hex_string = '0' + hex_string
+
+    return binascii.unhexlify(hex_string)
+    """
     return binascii.unhexlify(((hex(int(bitstring,2)))[2:]).zfill(bitstring_len//4))
 
 def bytestring2bitstring(bytestring, bitstring_len):
@@ -396,12 +537,27 @@ def decode_list_CRC_index(decoded_msg_list, bytes_per_oligo, num_oligos, pad):
                 return (index, payload_bytes, decoded_msg_)
     return (None, None, None)
 
+def validate_CRC(decoded_msg_list, pad):
+    for decoded_msg_ in decoded_msg_list:
+        # remove padding, if any
+        if pad:
+            decoded_msg = decoded_msg_[:-1]
+        else:
+            decoded_msg = decoded_msg_
+        length_with_crc = math.ceil(len(decoded_msg)/8)*8
+        bytestring_with_crc = bitstring2bytestring(decoded_msg, length_with_crc)
+        crc = crc8.crc8(bytestring_with_crc[:-crc_len//8])
+        if crc.digest() == bytestring_with_crc[-crc_len//8:]:
+            return True, decoded_msg_
+    return False, []
+
+
 
 def get_output_list(decoded_oligo1, decoded_oligo2, decoded_index, oligo_len):
-    
+
     if decoded_index is None:
         return []
-    
+
     # Get index
     index_bit_string = bytestring2bitstring(decoded_index,8*math.ceil(index_len/8))
     index_bit_string = index_bit_string[-index_len:]
@@ -459,9 +615,9 @@ def decode_list_2CRC_index(decoded_msg_list, bytes_per_oligo, num_oligos, pad):
 
         index_oligo1 = index_bytes + oligo1
         index_oligo2 = index_bytes + oligo2
-        crc1 = crc8.crc8(index_oligo1) 
+        crc1 = crc8.crc8(index_oligo1)
         crc2 = crc8.crc8(index_oligo2)
-       
+
         index_bit_string = bytestring2bitstring(index_bytes,8*math.ceil(index_len/8))
         index_bit_string = index_bit_string[-index_len:]
         index_prp = int(index_bit_string,2)
@@ -473,8 +629,8 @@ def decode_list_2CRC_index(decoded_msg_list, bytes_per_oligo, num_oligos, pad):
                 decoded_oligo2 = oligo2
                 decoded_index = index_bytes
                 break
-        
-         
+
+
         # Try to extract the first oligo
         if crc1.digest() == crc1_bytes:
             if (index < num_oligos) and (decoded_oligo1 is None):
@@ -487,7 +643,7 @@ def decode_list_2CRC_index(decoded_msg_list, bytes_per_oligo, num_oligos, pad):
                 decoded_oligo2 = oligo2
                 decoded_index = index_bytes
 
-        
+
     # Create segments from the oligo_output
     output_list = get_output_list(decoded_oligo1, decoded_oligo2, decoded_index, oligo_len)
 
@@ -500,9 +656,9 @@ def decode_list_2CRC_index(decoded_msg_list, bytes_per_oligo, num_oligos, pad):
 
 def bonito_basecall_generate_move(post_file, fastq_file, trans_file):
     '''
-    perform CTC decoding (greedy) to generate fastq file and a file with 
+    perform CTC decoding (greedy) to generate fastq file and a file with
     the time steps when each new base starts.
-    The reason for working with greedy is that it allows us to make a trans 
+    The reason for working with greedy is that it allows us to make a trans
     (move) matrix which is not possible with beam search.
     Note that the decoder still uses beam search later on, this is just for
     the barcode removal
@@ -559,7 +715,7 @@ def simulate_and_decode(oligo_file, decoded_data_file,  num_reads, data_file_siz
         # call bonito to generate CTC posterior table
         post_filename = 'tmp.'+rnd+'.post'
         decoded_filename = 'tmp.'+rnd+'.dec'
-        subprocess.run(['bonito','basecaller', bonito_model_path, fast5_dir, '--post_file', post_filename,'--device','cpu']) 
+        subprocess.run(['bonito','basecaller', bonito_model_path, fast5_dir, '--post_file', post_filename,'--device','cpu'])
 
         rc_flag = ''
         if rc:
@@ -644,15 +800,15 @@ def simulate_and_decode_2crc(oligo_file, decoded_data_file,  num_reads, data_fil
         # call bonito to generate CTC posterior table
         post_filename = 'tmp.'+rnd+'.post'
         decoded_filename = 'tmp.'+rnd+'.dec'
-        subprocess.run(['bonito','basecaller', bonito_model_path, fast5_dir, '--post_file', post_filename,'--device','cpu']) 
+        subprocess.run(['bonito','basecaller', bonito_model_path, fast5_dir, '--post_file', post_filename,'--device','cpu'])
         rc_flag = ''
         if rc:
             rc_flag = '--rc'
         subprocess.run([PATH_TO_VITERBI_NANOPORE,'-m', 'decode','-i',post_filename,'-o',decoded_filename,'--mem-conv',str(conv_m),'--msg-len',str(msg_len),'-l',str(list_size),'-t',str(num_thr),'-r',str(conv_r),rc_flag,'--max-deviation','20'])
         with open(decoded_filename) as f:
             decoded_msg_list = [l.rstrip('\n') for l in f.readlines()]
-        
-        
+
+
         #output a list of index, pos and payload_bytes
         output_list = decode_list_2CRC_index(decoded_msg_list,bytes_per_oligo,num_oligos,pad)
         print(output_list)
@@ -669,7 +825,7 @@ def simulate_and_decode_2crc(oligo_file, decoded_data_file,  num_reads, data_fil
                 decoded_index_dict[pos][index] = sorted(decoded_index_dict[pos][index],key=lambda x: -x[1])
             else:
                 decoded_index_dict[pos][index] = [[payload_bytes,1]]
-    
+
         os.remove(fast5_filename)
         os.remove(post_filename)
         os.remove(decoded_filename)
@@ -677,7 +833,7 @@ def simulate_and_decode_2crc(oligo_file, decoded_data_file,  num_reads, data_fil
     decoded_list = []
     for segment_id in range(num_RS_segments):
         decoded_list.append([[k, decoded_index_dict[segment_id][k][0][0]] for k in decoded_index_dict[segment_id]])
-    
+
     # Decode each segment separately
     RS_decoded_list = []
     for segment_id in range(num_RS_segments):
@@ -701,7 +857,7 @@ if __name__ == '__main__':
     file_size = 200
     tmp_input_file = 'tmpfile.'+rnd
     with open(tmp_input_file, 'wb') as fout:
-        fout.write(os.urandom(file_size)) 
+        fout.write(os.urandom(file_size))
     # set parameters common to 1 CRC and 2 CRC cases
     RS_redundancy = 0.25
     conv_m = 8 # conv code memory
@@ -711,9 +867,9 @@ if __name__ == '__main__':
     num_reads = 100
 
     # 1 CRC experiments
-    bytes_per_oligo = 18 # number of payload bytes per oligo 
+    bytes_per_oligo = 18 # number of payload bytes per oligo
     conv_pad = False # determined based on the convolutional code puncturing pattern and msg len
-    encode(data_file = tmp_input_file, oligo_file = oligo_file, bytes_per_oligo = bytes_per_oligo, RS_redundancy = RS_redundancy, conv_m = conv_m, conv_r = conv_r, pad=conv_pad)    
+    encode(data_file = tmp_input_file, oligo_file = oligo_file, bytes_per_oligo = bytes_per_oligo, RS_redundancy = RS_redundancy, conv_m = conv_m, conv_r = conv_r, pad=conv_pad)
     simulate_and_decode(oligo_file = oligo_file,decoded_data_file=decoded_data_file,num_reads=num_reads,data_file_size = file_size,bytes_per_oligo = bytes_per_oligo, RS_redundancy = RS_redundancy, conv_m = conv_m, conv_r = conv_r, pad=conv_pad)
 
     print('filecmp',filecmp.cmp(tmp_input_file,decoded_data_file))
@@ -723,7 +879,7 @@ if __name__ == '__main__':
     # 2 CRC experiments
     bytes_per_oligo = 16 # number of payload bytes per oligo
     conv_pad = True # determined based on the convolutional code puncturing pattern and msg len
-    encode_2crc(data_file = tmp_input_file, oligo_file = oligo_file, bytes_per_oligo = bytes_per_oligo, RS_redundancy = RS_redundancy, conv_m = conv_m, conv_r = conv_r, pad=conv_pad)    
+    encode_2crc(data_file = tmp_input_file, oligo_file = oligo_file, bytes_per_oligo = bytes_per_oligo, RS_redundancy = RS_redundancy, conv_m = conv_m, conv_r = conv_r, pad=conv_pad)
     simulate_and_decode_2crc(oligo_file = oligo_file,decoded_data_file=decoded_data_file,num_reads=num_reads,data_file_size = file_size,bytes_per_oligo = bytes_per_oligo, RS_redundancy = RS_redundancy, conv_m = conv_m, conv_r = conv_r, pad=conv_pad)
 
     print('filecmp',filecmp.cmp(tmp_input_file,decoded_data_file))
@@ -731,3 +887,53 @@ if __name__ == '__main__':
     os.remove(decoded_data_file)
 
     os.remove(tmp_input_file)
+
+
+
+def return_filtered_FERs(DECODED_LISTS_DIR, MAX_LIST_SIZE, pad):
+    list_size_arr = [2**i for i in range(6)]
+    list_size_arr = [el for el in list_size_arr if el <= MAX_LIST_SIZE]
+
+    num_list_sizes = len(list_size_arr)
+    max_list_size = list_size_arr[-1]
+
+    percent_correct_CRC = [0] * num_list_sizes
+    percent_erased_CRC = [0] * num_list_sizes
+    percent_incorrect_CRC = [0] * num_list_sizes
+    FER_filtered = [0] * num_list_sizes
+
+    num_reads = 0
+    num_correct = [0] * num_list_sizes
+    num_erasure_CRC_index = [0] * num_list_sizes
+    num_error_CRC_index = [0] * num_list_sizes
+    decoded_index_dict = [{}] * num_list_sizes
+
+    for filename in os.listdir(DECODED_LISTS_DIR):
+            if not filename.startswith("list_"):
+                continue
+            num_reads += 1
+
+            with open(os.path.join(DECODED_LISTS_DIR,filename)) as f:
+                decoded_msg_list = [l.rstrip('\n') for l in f.readlines()]
+                correct_msg = decoded_msg_list[-1]
+                decoded_msg_list = decoded_msg_list[:-1]
+                decoded_msg_list = decoded_msg_list[:max_list_size]
+            for i, list_size in enumerate(list_size_arr):
+                crc_check, decoded_msg = validate_CRC(decoded_msg_list[:list_size], pad)
+                if crc_check == False:
+                    num_erasure_CRC_index[i] += 1
+                else:
+                    if decoded_msg == correct_msg:
+                        num_correct[i] += 1
+                    else:
+                        num_error_CRC_index[i] += 1
+
+    for i in range(num_list_sizes):
+        percent_correct_CRC[i] = num_correct[i] * 100 / num_reads
+        percent_erased_CRC[i] = num_erasure_CRC_index[i] * 100 / num_reads
+        percent_incorrect_CRC[i] = num_error_CRC_index[i] * 100 / num_reads
+        FER_filtered[i] = percent_incorrect_CRC[i] / (percent_correct_CRC[i] + percent_incorrect_CRC[i])
+
+    return percent_erased_CRC, FER_filtered
+
+

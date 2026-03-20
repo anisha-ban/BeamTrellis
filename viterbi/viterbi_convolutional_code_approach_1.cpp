@@ -1,4 +1,6 @@
+
 #include <omp.h>
+#include <cassert>
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -13,7 +15,7 @@
 #include <unordered_set>
 #include <vector>
 #include "cxxopts.hpp"
-
+#include <atomic>
 const uint8_t NBASE = 4;
 const char int2base[NBASE] = {'A', 'C', 'G', 'T'};
 
@@ -34,9 +36,9 @@ struct LVA_path_t {
   float score_nonblank; // score for path ending with non-blank base
   float score_blank; // score for path ending with non-blank base
   float score; // logsumexp(score_nonblank,score_blank), used for sorting
-  // If score is -INF, score_nonblank and score_blank can be garbage 
+  // If score is -INF, score_nonblank and score_blank can be garbage
   uint8_t last_base; // for computing updated score_nonblank for stay transition
-                     // and to compare with new_base in non-stay transitions 
+                     // and to compare with new_base in non-stay transitions
                      // for checking whether nonblank->nonblank makes sense
 
   LVA_path_t() {
@@ -46,7 +48,7 @@ struct LVA_path_t {
     compute_score();
   }
 
-  LVA_path_t(const bitset_t &msg_, const float &score_nonblank_, 
+  LVA_path_t(const bitset_t &msg_, const float &score_nonblank_,
              const float &score_blank_, const uint8_t &last_base_) {
     msg = msg_;
     score_nonblank = score_nonblank_;
@@ -66,7 +68,7 @@ struct LVA_path_t {
 struct prev_state_info_t {
   uint32_t st_conv;
   uint8_t new_base; // undefined for transition from same conv state, otherwise
-                    // stores the new base added in this transition 
+                    // stores the new base added in this transition
   uint8_t msg_shift;  // shift in message in transition
   uint8_t msg_newbits;  // new bits in transition (new_msg = (old_msg <<
                         // msg_shift)|msg_newbits)
@@ -138,11 +140,16 @@ uint32_t conv_output(const uint8_t output_idx, const uint32_t cur_state,
 
 bool is_valid_state(const uint32_t &st2_pos, const uint32_t &st2_conv,
                     const uint32_t &msg_len);
-
+// without offset
 std::vector<std::vector<bool>> decode_post_conv_parallel_LVA(
     const std::vector<ctc_mat_t> &post, const uint32_t msg_len,
     const uint32_t list_size, const uint32_t num_thr,
-    const uint32_t max_deviation);
+    const uint32_t max_deviation, const std::string& cfile);
+// with offset
+std::vector<std::vector<bool>> decode_post_conv_parallel_LVA(
+        const std::vector<ctc_mat_t> &post, const uint32_t msg_len,
+        const uint32_t list_size, const uint32_t num_thr,
+        const uint32_t max_deviation, const std::vector<uint8_t> v, const std::string& cfile);
 
 std::vector<prev_state_info_t> find_prev_states(const uint32_t &st2_conv,
                                                 const uint8_t &punc_pattern);
@@ -181,10 +188,15 @@ int main(int argc, char **argv) {
       "decoding (tradeoff b/w speed and accuracy) (default: infinite)",
       cxxopts::value<uint32_t>())("rc",
                                   "Reverse complement read (for decoding)")(
+                                    "offset","for decoding with an offset vector",
+                                  cxxopts::value<std::string>()->default_value(""))(
       "t,num-thr",
       "Number of threads for convolutional code decoding (default 1)",
-      cxxopts::value<uint32_t>()->default_value("1"))("h,help",
-                                                      "Display this message");
+      cxxopts::value<uint32_t>()->default_value("1"))
+      ("complexity_log_file", "File to log decoding complexity metrics",
+     cxxopts::value<std::string>()->default_value(""))
+      ("h,help", "Display this message");
+
   auto result = options.parse(argc, argv);
 
   if (result.count("help")) {
@@ -200,6 +212,7 @@ int main(int argc, char **argv) {
   std::string mode = result["mode"].as<std::string>();
   std::string infile = result["infile"].as<std::string>();
   std::string outfile = result["outfile"].as<std::string>();
+  std::string complexity_log_file = result["complexity_log_file"].as<std::string>();
   if (mode == "encode" || mode == "decode") {
     if (!result.count("mem-conv")) {
       std::cout << "Memory of convolutional code not specified.\n";
@@ -240,16 +253,16 @@ int main(int argc, char **argv) {
       write_bit_array_in_bases(encoded_msg_vec, outfile);
     } else {
       // do list decoding
-      // 
-      // based on ideas from Parallel LVA algorithm as described in 
+      //
+      // based on ideas from Parallel LVA algorithm as described in
       // https://github.com/shubhamchandak94/kBestViterbi/blob/master/kBestViterbi.py
       // or in ieeexplore.ieee.org/iel1/26/12514/00577040.pdf
       // and on beam search for CTC as described in https://distill.pub/2017/ctc/
       // and in https://gist.github.com/awni/56369a90d03953e370f3964c826ed4b0
-      // 
+      //
       // We have states correspoding to conv code state and pos in msg.
-      // Each state stores a list of messages with their score of ending in 
-      // blank and non-blank. At next step, we add one character, add (logsumexp) the 
+      // Each state stores a list of messages with their score of ending in
+      // blank and non-blank. At next step, we add one character, add (logsumexp) the
       // scores for all the ways a new message can be obtained, and take the top ones.
 
       uint32_t max_deviation =
@@ -257,16 +270,44 @@ int main(int argc, char **argv) {
           1;  // don't restrict anything, do full exact Viterbi
       if (result.count("max-deviation"))
         max_deviation = result["max-deviation"].as<uint32_t>();
+
+      std::vector<uint8_t> offset;
+
+      if (result.count("offset")){
+          std::string offset_str = result["offset"].as<std::string>();
+          assert(!offset_str.empty());
+          for (char c : offset_str) {
+              if (c < '0' || c > '3') {
+                    std::cout << "Invalid offset vector: all digits must be 0-3.\n";
+                    return -1;
+              }
+              offset.push_back(c - '0');
+          }
+          //std::cout << "Using offset vector of length " << offset.size() << "\n";
+      }
+
       std::vector<ctc_mat_t> post = read_ctc_post(infile);
       uint32_t list_size = result["list-size"].as<uint32_t>();
       uint32_t num_thr = result["num-thr"].as<uint32_t>();
-      auto decoded_msg_list = decode_post_conv_parallel_LVA(
-          post, msg_len, list_size, num_thr, max_deviation);
-      std::ofstream fout(outfile);
-      for (auto decoded_msg : decoded_msg_list) {
-        for (auto decoded_msg_bit : decoded_msg)
-          fout << std::to_string(decoded_msg_bit);
-        fout << "\n";
+      if(offset.empty()){
+        auto decoded_msg_list = decode_post_conv_parallel_LVA(
+          post, msg_len, list_size, num_thr, max_deviation, complexity_log_file);
+          std::ofstream fout(outfile);
+          for (auto decoded_msg : decoded_msg_list) {
+            for (auto decoded_msg_bit : decoded_msg)
+              fout << std::to_string(decoded_msg_bit);
+            fout << "\n";
+          }
+      }
+      else{
+        auto decoded_msg_list = decode_post_conv_parallel_LVA(
+          post, msg_len, list_size, num_thr, max_deviation, offset, complexity_log_file);
+          std::ofstream fout(outfile);
+          for (auto decoded_msg : decoded_msg_list) {
+            for (auto decoded_msg_bit : decoded_msg)
+              fout << std::to_string(decoded_msg_bit);
+            fout << "\n";
+          }
       }
     }
   } else {
@@ -284,6 +325,11 @@ int set_conv_params(uint8_t mem_conv_param, uint8_t rate_param,
   mem_conv = mem_conv_param;
   nstate_conv = 1 << mem_conv;
   switch (mem_conv) {
+    case 4: // AB
+      G[0] = 027;
+      G[1] = 031;
+      initial_state_conv = 0b1001;
+      break;
     case 6:
       G[0] = 0171;
       G[1] = 0133;
@@ -594,237 +640,517 @@ uint32_t get_state_idx(const uint32_t st_pos, const uint32_t st_conv) {
 std::vector<std::vector<bool>> decode_post_conv_parallel_LVA(
     const std::vector<ctc_mat_t> &post, const uint32_t msg_len,
     const uint32_t list_size, const uint32_t num_thr,
-    const uint32_t max_deviation) {
-  omp_set_num_threads(num_thr);
-  float INF = std::numeric_limits<float>::infinity();
-  uint64_t nstate_total_64 = nstate_pos * nstate_conv;
-  if (nstate_total_64 >= ((uint64_t)1 << 32))
-    throw std::runtime_error("Too many states, can't fit in 32 bits");
-  uint32_t nstate_total = (uint32_t)nstate_total_64;
-  uint32_t nblk = post.size();
-  if (post.size() < nstate_pos + 1)
-    throw std::runtime_error("Too small post matrix");
+    const uint32_t max_deviation, const std::string& complexity_log_file = "") {
+    omp_set_num_threads(num_thr);
+    std::atomic<uint64_t> total_score_computations(0);
+    float INF = std::numeric_limits<float>::infinity();
+    uint64_t nstate_total_64 = nstate_pos * nstate_conv;
+    if (nstate_total_64 >= ((uint64_t)1 << 32))
+      throw std::runtime_error("Too many states, can't fit in 32 bits");
+    uint32_t nstate_total = (uint32_t)nstate_total_64;
+    uint32_t nblk = post.size();
+    if (post.size() < nstate_pos + 1)
+      throw std::runtime_error("Too small post matrix");
 
-  // instead of traceback, store the msg till now as a bitset
-  if (msg_len > BITSET_SIZE)
-    throw std::runtime_error("msg_len can't be above BITSET_SIZE");
+    // instead of traceback, store the msg till now as a bitset
+    if (msg_len > BITSET_SIZE)
+      throw std::runtime_error("msg_len can't be above BITSET_SIZE");
 
-  // arrays for storing previous and current best paths
-  // [nstate_total][list_size]
-  LVA_path_t **curr_best_paths = new LVA_path_t *[nstate_total];
-  LVA_path_t **prev_best_paths = new LVA_path_t *[nstate_total];
-  for (uint32_t i = 0; i < nstate_total; i++) {
-    curr_best_paths[i] = new LVA_path_t[list_size]();
-    prev_best_paths[i] = new LVA_path_t[list_size]();
-  }
+    // arrays for storing previous and current best paths
+    // [nstate_total][list_size]
+    LVA_path_t **curr_best_paths = new LVA_path_t *[nstate_total];
+    LVA_path_t **prev_best_paths = new LVA_path_t *[nstate_total];
+    for (uint32_t i = 0; i < nstate_total; i++) {
+      curr_best_paths[i] = new LVA_path_t[list_size]();
+      prev_best_paths[i] = new LVA_path_t[list_size]();
+    }
 
-  // lambda expression to compare paths (decreasing in score)
-  auto LVA_path_t_compare = [](const LVA_path_t &a, const LVA_path_t &b) {
-                              return a.score > b.score;
-                            };
+    // lambda expression to compare paths (decreasing in score)
+    auto LVA_path_t_compare = [](const LVA_path_t &a, const LVA_path_t &b) {
+                                return a.score > b.score;
+                              };
 
-  // find valid states based on intial and final states as well as
-  // synchronization markers
-  std::vector<bool> valid_state_array(nstate_pos * nstate_conv);
-#pragma omp parallel
-#pragma omp for
-  for (uint32_t st_pos = 0; st_pos < nstate_pos; st_pos++)
-    for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++)
-      valid_state_array[nstate_conv * st_pos + st_conv] =
-          is_valid_state(st_pos2msg_pos[st_pos], st_conv, msg_len);
+    // find valid states based on intial and final states as well as
+    // synchronization markers
+    std::vector<bool> valid_state_array(nstate_pos * nstate_conv);
+  #pragma omp parallel
+  #pragma omp for
+    for (uint32_t st_pos = 0; st_pos < nstate_pos; st_pos++)
+      for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++)
+        valid_state_array[nstate_conv * st_pos + st_conv] =
+            is_valid_state(st_pos2msg_pos[st_pos], st_conv, msg_len);
 
-  // precompute the previous states and associated info for all states now
-  // note that this is valid only for st_pos > 0 (if st_pos = 0, only previous
-  // state allowed is same state - which is always first entry in the
-  // prev_state_vector)
-  std::vector<std::vector<std::vector<prev_state_info_t>>> prev_state_vector(4);
-#pragma omp parallel
-#pragma omp for
-  for (uint8_t punc_pattern = 0; punc_pattern < 4; punc_pattern++) {
-    // only fill if this punc_pattern is relevant for this rate
-    if (std::find(puncturing_pattern,
-                  puncturing_pattern + puncturing_pattern_len,
-                  punc_pattern) == puncturing_pattern + puncturing_pattern_len)
-      continue;
-    prev_state_vector[punc_pattern].resize(nstate_conv);
-    for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++)
-        prev_state_vector[punc_pattern][st_conv] =
-            find_prev_states(st_conv, punc_pattern);
-  }
+    // precompute the previous states and associated info for all states now
+    // note that this is valid only for st_pos > 0 (if st_pos = 0, only previous
+    // state allowed is same state - which is always first entry in the
+    // prev_state_vector)
+    std::vector<std::vector<std::vector<prev_state_info_t>>> prev_state_vector(4);
+  #pragma omp parallel
+  #pragma omp for
+    for (uint8_t punc_pattern = 0; punc_pattern < 4; punc_pattern++) {
+      // only fill if this punc_pattern is relevant for this rate
+      if (std::find(puncturing_pattern,
+                    puncturing_pattern + puncturing_pattern_len,
+                    punc_pattern) == puncturing_pattern + puncturing_pattern_len)
+        continue;
+      prev_state_vector[punc_pattern].resize(nstate_conv);
+      for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++)
+          prev_state_vector[punc_pattern][st_conv] =
+              find_prev_states(st_conv, punc_pattern);
+    }
 
-  // set score_blank to zero for initial state
-  uint32_t initial_st = get_state_idx(0, initial_state_conv);
-  curr_best_paths[initial_st][0].score_blank = 0.0;
-  curr_best_paths[initial_st][0].score_nonblank = -INF;
-  curr_best_paths[initial_st][0].compute_score();
-  // forward Viterbi pass
+    // set score_blank to zero for initial state
+    uint32_t initial_st = get_state_idx(0, initial_state_conv);
+    curr_best_paths[initial_st][0].score_blank = 0.0;
+    curr_best_paths[initial_st][0].score_nonblank = -INF;
+    curr_best_paths[initial_st][0].compute_score();
+    // forward Viterbi pass
 
-  for (uint32_t t = 0; t < nblk; t++) {
-    // swap prev and curr arrays
-    std::swap(curr_best_paths, prev_best_paths);
+    for (uint32_t t = 0; t < nblk; t++) {
+      // swap prev and curr arrays
+      std::swap(curr_best_paths, prev_best_paths);
 
-    // st is current state
-    uint32_t st_pos_start =
-        std::max((int64_t)nstate_pos - 2 - (nblk - 1 - t), (int64_t)0);
-    uint32_t st_pos_end = std::min(t + 2, nstate_pos);
+      // st is current state
+      uint32_t st_pos_start =
+          std::max((int64_t)nstate_pos - 2 - (nblk - 1 - t), (int64_t)0);
+      uint32_t st_pos_end = std::min(t + 2, nstate_pos);
 
-    st_pos_start = std::max(
-        (int64_t)st_pos_start, (int64_t)((double)(t) / nblk * nstate_pos - max_deviation));
-    st_pos_end = std::min(st_pos_start + 2 * max_deviation, st_pos_end);
+      st_pos_start = std::max(
+          (int64_t)st_pos_start, (int64_t)((double)(t) / nblk * nstate_pos - max_deviation));
+      st_pos_end = std::min(st_pos_start + 2 * max_deviation, st_pos_end);
 
-    // only allow pos which can have non -INF scores or will lead to useful
-    // final states initially large pos is not allowed, and at the end small
-    // pos not allowed (since those can't lead to correct st_pos at the end).
+      // only allow pos which can have non -INF scores or will lead to useful
+      // final states initially large pos is not allowed, and at the end small
+      // pos not allowed (since those can't lead to correct st_pos at the end).
 
-#pragma omp parallel
-#pragma omp for schedule(dynamic)
-    for (uint32_t st_pos = st_pos_start; st_pos < st_pos_end; st_pos++) {
+  #pragma omp parallel
+  #pragma omp for schedule(dynamic)
+      for (uint32_t st_pos = st_pos_start; st_pos < st_pos_end; st_pos++) {
 
-      // vector containing the candidate items for next step list
-      std::vector<LVA_path_t> candidate_paths;
+        // vector containing the candidate items for next step list
+        std::vector<LVA_path_t> candidate_paths;
 
-      uint8_t punc_pattern = 0;
-      if (st_pos != 0)
-        punc_pattern =
-            puncturing_pattern[(st_pos - 1) % puncturing_pattern_len];
+        uint8_t punc_pattern = 0;
+        if (st_pos != 0)
+          punc_pattern =
+              puncturing_pattern[(st_pos - 1) % puncturing_pattern_len];
 
-      for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++) {
-        // check if this is a valid state, otherwise continue
-        if (!valid_state_array[nstate_conv * st_pos + st_conv]) continue;
+        for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++) {
+          // check if this is a valid state, otherwise continue
+          if (!valid_state_array[nstate_conv * st_pos + st_conv]) continue;
 
-        // clear candidate_paths
-        candidate_paths.clear();
+          // clear candidate_paths
+          candidate_paths.clear();
 
-        // first do stay transition
-        uint32_t st = get_state_idx(st_pos, st_conv);
-        uint32_t num_stay_candidates = 0;
-        for (uint32_t i = 0; i < list_size; i++) {
-          if (prev_best_paths[st][i].score == -INF)
-            break;
-          num_stay_candidates++;
-          float new_score_blank = logsumexpf(prev_best_paths[st][i].score_blank + post[t][NBASE], 
-                                   prev_best_paths[st][i].score_nonblank + post[t][NBASE]);
-          float new_score_nonblank = prev_best_paths[st][i].score_nonblank +
-                                     post[t][prev_best_paths[st][i].last_base];
-          candidate_paths.emplace_back(prev_best_paths[st][i].msg,new_score_nonblank,
-                                       new_score_blank,prev_best_paths[st][i].last_base);
-        }
+          // first do stay transition
+          uint32_t st = get_state_idx(st_pos, st_conv);
+          uint32_t num_stay_candidates = 0;
+          for (uint32_t i = 0; i < list_size; i++) {
+            if (prev_best_paths[st][i].score == -INF)
+              break;
+            num_stay_candidates++;
+            total_score_computations += 2;
+            float new_score_blank = logsumexpf(prev_best_paths[st][i].score_blank + post[t][NBASE],
+                                     prev_best_paths[st][i].score_nonblank + post[t][NBASE]);
+            float new_score_nonblank = prev_best_paths[st][i].score_nonblank +
+                                       post[t][prev_best_paths[st][i].last_base];
+            candidate_paths.emplace_back(prev_best_paths[st][i].msg,new_score_nonblank,
+                                         new_score_blank,prev_best_paths[st][i].last_base);
+          }
 
-        // Now go through non-stay transitions.
-        // For each case, first look in the stay transitions to check if the msg has
-        // already appeared before
-        // start with psidx = 1, since 0 corresponds to stay (already done above)
-        const auto &prev_states_st =
-            prev_state_vector[punc_pattern][st_conv];
-        if (st_pos != 0) { // otherwise only stay transition makes sense
-          for (uint32_t psidx = 1; psidx < prev_states_st.size(); psidx++) {
-            uint32_t prev_st_pos = st_pos - 1;
-            uint32_t prev_st = get_state_idx(prev_st_pos, prev_states_st[psidx].st_conv);
-            uint8_t msg_shift = prev_states_st[psidx].msg_shift;
-            uint8_t msg_newbits = prev_states_st[psidx].msg_newbits;
-            uint8_t new_base = prev_states_st[psidx].new_base;
-            for (uint32_t i = 0; i < list_size; i++) {
-              if (prev_best_paths[prev_st][i].score == -INF)
-                break;
-              bitset_t msg = prev_best_paths[prev_st][i].msg;
-              msg = (msg << msg_shift) | bitset_t(msg_newbits);
-              float new_score_blank = -INF;
-              float new_score_nonblank;
-              if (new_base != prev_best_paths[prev_st][i].last_base) {
-                new_score_nonblank = 
-                    logsumexpf(prev_best_paths[prev_st][i].score_blank + post[t][new_base],
-                             prev_best_paths[prev_st][i].score_nonblank + post[t][new_base]);
-              } else {
-                // the newly added base is same as last base so we can't have the 
-                // thing ending with non_blank (otherwise it gets collapsed)
-                new_score_nonblank = prev_best_paths[prev_st][i].score_blank + post[t][new_base];
-              }
-              if (new_score_nonblank == -INF)
-              {
-                continue;
-                // overall score is -INF (this might happen if 
-                // score_blank for previous path is -INF and we are
-                // in second case above) 
-              }
+          // Now go through non-stay transitions.
+          // For each case, first look in the stay transitions to check if the msg has
+          // already appeared before
+          // start with psidx = 1, since 0 corresponds to stay (already done above)
+          const auto &prev_states_st =
+              prev_state_vector[punc_pattern][st_conv];
+          if (st_pos != 0) { // otherwise only stay transition makes sense
+            for (uint32_t psidx = 1; psidx < prev_states_st.size(); psidx++) {
+              uint32_t prev_st_pos = st_pos - 1;
+              uint32_t prev_st = get_state_idx(prev_st_pos, prev_states_st[psidx].st_conv);
+              uint8_t msg_shift = prev_states_st[psidx].msg_shift;
+              uint8_t msg_newbits = prev_states_st[psidx].msg_newbits;
+              uint8_t new_base = prev_states_st[psidx].new_base;
+              for (uint32_t i = 0; i < list_size; i++) {
+                if (prev_best_paths[prev_st][i].score == -INF)
+                  break;
+                bitset_t msg = prev_best_paths[prev_st][i].msg;
+                msg = (msg << msg_shift) | bitset_t(msg_newbits);
+                float new_score_blank = -INF;
+                float new_score_nonblank;
+                total_score_computations += 1;
+                if (new_base != prev_best_paths[prev_st][i].last_base) {
+                  new_score_nonblank =
+                      logsumexpf(prev_best_paths[prev_st][i].score_blank + post[t][new_base],
+                               prev_best_paths[prev_st][i].score_nonblank + post[t][new_base]);
+                } else {
+                  // the newly added base is same as last base so we can't have the
+                  // thing ending with non_blank (otherwise it gets collapsed)
+                  new_score_nonblank = prev_best_paths[prev_st][i].score_blank + post[t][new_base];
+                }
+                if (new_score_nonblank == -INF)
+                {
+                  continue;
+                  // overall score is -INF (this might happen if
+                  // score_blank for previous path is -INF and we are
+                  // in second case above)
+                }
 
-              // now check if this is already present in the stay transitions.
-              // first try to match the new_base for speed, then look at full msg.
-              // if already present, update the nonblank score
-              bool match_found = false;
-              for (uint32_t j = 0; j < num_stay_candidates; j++) {
-                if (new_base == candidate_paths[j].last_base) {
-                  if (msg == candidate_paths[j].msg) {
-                    match_found = true;
-                    candidate_paths[j].score_nonblank = 
-                            logsumexpf(candidate_paths[j].score_nonblank,new_score_nonblank);
-                    break;
+                // now check if this is already present in the stay transitions.
+                // first try to match the new_base for speed, then look at full msg.
+                // if already present, update the nonblank score
+                bool match_found = false;
+                for (uint32_t j = 0; j < num_stay_candidates; j++) {
+                  if (new_base == candidate_paths[j].last_base) {
+                    if (msg == candidate_paths[j].msg) {
+                      match_found = true;
+                      candidate_paths[j].score_nonblank =
+                              logsumexpf(candidate_paths[j].score_nonblank,new_score_nonblank);
+                      break;
+                    }
                   }
                 }
-              }
-              if (!match_found) {
-                candidate_paths.emplace_back(msg,new_score_nonblank,new_score_blank,new_base);
+                if (!match_found) {
+                  candidate_paths.emplace_back(msg,new_score_nonblank,new_score_blank,new_base);
+                }
               }
             }
           }
-        }
-       
-        uint32_t num_candidates = candidate_paths.size(); 
-        // update scores based on score_blank and score_nonblank
-        for (uint32_t i = 0; i < num_candidates; i++)
-           candidate_paths[i].compute_score();
 
-        auto num_candidates_to_keep = std::min(list_size, num_candidates);
-        // use nth_element to to do partial sorting if num_candidates_to_keep < num_candidates
-        if (num_candidates_to_keep < num_candidates && num_candidates_to_keep > 0)
-          std::nth_element(candidate_paths.begin(),
-                           candidate_paths.begin()+num_candidates_to_keep-1,
-                           candidate_paths.end(),
-                           LVA_path_t_compare);
-        // copy over top candidate paths to curr_best
-        std::copy(candidate_paths.begin(),candidate_paths.begin()+num_candidates_to_keep,
-                    curr_best_paths[st]);
-        // fill any remaining positions in list with score -INF so they are not used later
-        for (uint32_t i = num_candidates_to_keep; i < list_size; i++)
-          curr_best_paths[st][i].score = -INF;
+          uint32_t num_candidates = candidate_paths.size();
+          // update scores based on score_blank and score_nonblank
+          for (uint32_t i = 0; i < num_candidates; i++)
+             candidate_paths[i].compute_score();
+
+          auto num_candidates_to_keep = std::min(list_size, num_candidates);
+          // use nth_element to to do partial sorting if num_candidates_to_keep < num_candidates
+          if (num_candidates_to_keep < num_candidates && num_candidates_to_keep > 0)
+            std::nth_element(candidate_paths.begin(),
+                             candidate_paths.begin()+num_candidates_to_keep-1,
+                             candidate_paths.end(),
+                             LVA_path_t_compare);
+          // copy over top candidate paths to curr_best
+          std::copy(candidate_paths.begin(),candidate_paths.begin()+num_candidates_to_keep,
+                      curr_best_paths[st]);
+          // fill any remaining positions in list with score -INF so they are not used later
+          for (uint32_t i = num_candidates_to_keep; i < list_size; i++)
+            curr_best_paths[st][i].score = -INF;
+        }
       }
     }
-  }
 
-  uint32_t st_pos = nstate_pos - 1, st_conv = final_state_conv;  // last state
-  LVA_path_t *LVA_path_list_final = curr_best_paths[get_state_idx(st_pos, st_conv)];
+    uint32_t st_pos = nstate_pos - 1, st_conv = final_state_conv;  // last state
+    LVA_path_t *LVA_path_list_final = curr_best_paths[get_state_idx(st_pos, st_conv)];
 
-  // sort in decreasing order by score 
-  // NOTE: the curr_best_paths list is not sorted since we use nth_element partial sorting
-  std::sort(LVA_path_list_final, LVA_path_list_final+list_size, LVA_path_t_compare);
+    // sort in decreasing order by score
+    // NOTE: the curr_best_paths list is not sorted since we use nth_element partial sorting
+    std::sort(LVA_path_list_final, LVA_path_list_final+list_size, LVA_path_t_compare);
 
-  std::vector<std::vector<bool>> decoded_msg_list;
+    std::vector<std::vector<bool>> decoded_msg_list;
 
-  // now convert bitset to bool vectors
-  for (uint32_t list_pos = 0; list_pos < list_size; list_pos++) {
-    std::vector<bool> decoded_msg(msg_len);
-    for (uint8_t i = 0; i < msg_len; i++)
-      decoded_msg[i] =
-          LVA_path_list_final[list_pos].msg[msg_len + mem_conv - 1 -
-                       i];  // due to way bitset is stored in reverse
-    if (rc_flag) std::reverse(decoded_msg.begin(), decoded_msg.end());
-    decoded_msg_list.push_back(decoded_msg);
-    // FOR DEBUGGING
-    /*
-        std::cout << "score: " << LVA_path_list_final[list_pos].score << "\n";
-        for (auto b : decoded_msg_list.back()) std::cout << b;
-        std::cout << "\n\n";
-    */
-  }
-  // std::cout << "Final list size: " << decoded_msg_list.size() << "\n";
+    // now convert bitset to bool vectors
+    for (uint32_t list_pos = 0; list_pos < list_size; list_pos++) {
+      std::vector<bool> decoded_msg(msg_len);
+      for (uint8_t i = 0; i < msg_len; i++)
+        decoded_msg[i] =
+            LVA_path_list_final[list_pos].msg[msg_len + mem_conv - 1 -
+                         i];  // due to way bitset is stored in reverse
+      if (rc_flag) std::reverse(decoded_msg.begin(), decoded_msg.end());
+      decoded_msg_list.push_back(decoded_msg);
+      // FOR DEBUGGING
+      /*
+          std::cout << "score: " << LVA_path_list_final[list_pos].score << "\n";
+          for (auto b : decoded_msg_list.back()) std::cout << b;
+          std::cout << "\n\n";
+      */
+    }
+    // std::cout << "Final list size: " << decoded_msg_list.size() << "\n";
 
-  for (uint32_t i = 0; i < nstate_total; i++) {
-    delete[] curr_best_paths[i];
-    delete[] prev_best_paths[i];
-  }
-  delete[] curr_best_paths;
-  delete[] prev_best_paths;
-  return decoded_msg_list;
+    for (uint32_t i = 0; i < nstate_total; i++) {
+      delete[] curr_best_paths[i];
+      delete[] prev_best_paths[i];
+    }
+    delete[] curr_best_paths;
+    delete[] prev_best_paths;
+
+    // Log complexity if filename provided
+    double avg_steps = (double) total_score_computations.load() / (double) nblk;
+    if (!complexity_log_file.empty()) {
+        std::ofstream log_file(complexity_log_file, std::ios::app);
+        if (log_file.is_open()) {
+            log_file << nblk << " " << total_score_computations.load() << " " << avg_steps << "\n";
+            log_file.close();
+        }
+    }
+
+
+    return decoded_msg_list;
 }
+
+// DECODER WITH OFFSET VECTOR
+std::vector<std::vector<bool>> decode_post_conv_parallel_LVA(
+      const std::vector<ctc_mat_t> &post, const uint32_t msg_len,
+      const uint32_t list_size, const uint32_t num_thr,
+      const uint32_t max_deviation, const std::vector<uint8_t> offset, const std::string& complexity_log_file = "") {
+
+    omp_set_num_threads(num_thr);
+    std::atomic<uint64_t> total_score_computations(0);
+    float INF = std::numeric_limits<float>::infinity();
+    uint64_t nstate_total_64 = nstate_pos * nstate_conv;
+
+    if (nstate_total_64 >= ((uint64_t)1 << 32))
+        throw std::runtime_error("Too many states, can't fit in 32 bits");
+
+    uint32_t nstate_total = (uint32_t)nstate_total_64;
+    uint32_t nblk = post.size();
+
+    std::cout << "nstate_pos=" << nstate_pos << ", offset length = " << offset.size() << std::endl;
+    assert(nstate_pos - 1 == offset.size());
+
+    if (post.size() < nstate_pos + 1)
+        throw std::runtime_error("Too small post matrix");
+
+    // instead of traceback, store the msg till now as a bitset
+    if (msg_len > BITSET_SIZE)
+        throw std::runtime_error("msg_len can't be above BITSET_SIZE");
+
+    // arrays for storing previous and current best paths
+    // [nstate_total][list_size]
+    LVA_path_t **curr_best_paths = new LVA_path_t *[nstate_total];
+    LVA_path_t **prev_best_paths = new LVA_path_t *[nstate_total];
+    for (uint32_t i = 0; i < nstate_total; i++) {
+        curr_best_paths[i] = new LVA_path_t[list_size]();
+        prev_best_paths[i] = new LVA_path_t[list_size]();
+    }
+
+    // lambda expression to compare paths (decreasing in score)
+    auto LVA_path_t_compare = [](const LVA_path_t &a, const LVA_path_t &b) {
+                                return a.score > b.score;
+                              };
+
+    // find valid states based on intial and final states as well as
+    // synchronization markers
+    std::vector<bool> valid_state_array(nstate_pos * nstate_conv);
+    #pragma omp parallel
+    #pragma omp for
+    for (uint32_t st_pos = 0; st_pos < nstate_pos; st_pos++)
+        for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++)
+            valid_state_array[nstate_conv * st_pos + st_conv] =
+                is_valid_state(st_pos2msg_pos[st_pos], st_conv, msg_len);
+
+    // precompute the previous states and associated info for all states now
+    // note that this is valid only for st_pos > 0 (if st_pos = 0, only previous
+    // state allowed is same state - which is always first entry in the
+    // prev_state_vector)
+    std::vector<std::vector<std::vector<prev_state_info_t>>> prev_state_vector(4);
+    #pragma omp parallel
+    #pragma omp for
+    for (uint8_t punc_pattern = 0; punc_pattern < 4; punc_pattern++) {
+      // only fill if this punc_pattern is relevant for this rate
+        if (std::find(puncturing_pattern,
+                      puncturing_pattern + puncturing_pattern_len,
+                      punc_pattern) == puncturing_pattern + puncturing_pattern_len)
+                      continue;
+        prev_state_vector[punc_pattern].resize(nstate_conv);
+        for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++)
+              prev_state_vector[punc_pattern][st_conv] = find_prev_states(st_conv, punc_pattern);
+    }
+
+    // set score_blank to zero for initial state
+    uint32_t initial_st = get_state_idx(0, initial_state_conv);
+    curr_best_paths[initial_st][0].score_blank = 0.0;
+    curr_best_paths[initial_st][0].score_nonblank = -INF;
+    curr_best_paths[initial_st][0].compute_score();
+
+    // ============================  forward Viterbi pass  =====================================
+    for (uint32_t t = 0; t < nblk; t++) {
+        // swap prev and curr arrays
+        std::swap(curr_best_paths, prev_best_paths);
+
+        // st is current state
+        uint32_t st_pos_start = std::max((int64_t)nstate_pos - 2 - (nblk - 1 - t), (int64_t)0);
+        uint32_t st_pos_end = std::min(t + 2, nstate_pos);
+
+        st_pos_start = std::max((int64_t)st_pos_start, (int64_t)((double)(t) / nblk * nstate_pos - max_deviation));
+        st_pos_end = std::min(st_pos_start + 2 * max_deviation, st_pos_end);
+
+        // only allow pos which can have non -INF scores or will lead to useful
+        // final states initially large pos is not allowed, and at the end small
+        // pos not allowed (since those can't lead to correct st_pos at the end).
+
+        #pragma omp parallel
+        #pragma omp for schedule(dynamic)
+        for (uint32_t st_pos = st_pos_start; st_pos < st_pos_end; st_pos++) { // ITERATE OVER CODEWORD POSITIONS
+
+            // vector containing the candidate items for next step list
+            std::vector<LVA_path_t> candidate_paths;
+            //uint8_t offset_symbol = offset[st_pos];
+            //uint8_t prev_offset_symbol = offset[st_pos - 1];
+
+            uint8_t punc_pattern = 0;
+            if (st_pos != 0)
+                punc_pattern =
+                    puncturing_pattern[(st_pos - 1) % puncturing_pattern_len];
+
+            for (uint32_t st_conv = 0; st_conv < nstate_conv; st_conv++) { // ITERATE OVER CONV CODE STATES
+                // check if this is a valid state, otherwise continue
+                if (!valid_state_array[nstate_conv * st_pos + st_conv]) continue;
+
+                // clear candidate_paths
+                candidate_paths.clear();
+
+                // first do stay transition
+                uint32_t st = get_state_idx(st_pos, st_conv); // COMBINE JUST CONV CODE STATE & CW POSITION
+                uint32_t num_stay_candidates = 0;
+                for (uint32_t i = 0; i < list_size; i++) {
+                    if (prev_best_paths[st][i].score == -INF)
+                        break;
+                    num_stay_candidates++;
+                    total_score_computations += 2;
+                    float new_score_blank = logsumexpf(prev_best_paths[st][i].score_blank + post[t][NBASE],
+                                             prev_best_paths[st][i].score_nonblank + post[t][NBASE]);  // sum of scores of all paths that ended with a blank
+                    //assert(prev_best_paths[st][i].last_base != NBASE);
+                    //if(st_pos == 1)
+                    //  std::cout << "t = " << st_pos << ", cb + ob = " << int2base[prev_best_paths[st][i].last_base] << " + " << int2base[offset[(st_pos > 0) ? (st_pos - 1) : 0]] << " = " << (int2base[(prev_best_paths[st][i].last_base + offset[(st_pos > 0) ? (st_pos - 1) : 0]) % 4]) << "\n";
+
+                    float new_score_nonblank = prev_best_paths[st][i].score_nonblank +
+                                               post[t][(prev_best_paths[st][i].last_base + offset[(st_pos > 0) ? (st_pos - 1) : 0]) % 4];
+                    candidate_paths.emplace_back(prev_best_paths[st][i].msg,new_score_nonblank,
+                                               new_score_blank, prev_best_paths[st][i].last_base);
+                }
+
+                // Now go through non-stay transitions.
+                // For each case, first look in the stay transitions to check if the msg has
+                // already appeared before
+                // start with psidx = 1, since 0 corresponds to stay (already done above)
+                const auto &prev_states_st =
+                    prev_state_vector[punc_pattern][st_conv];
+                if (st_pos != 0) { // otherwise only stay transition makes sense
+                    for (uint32_t psidx = 1; psidx < prev_states_st.size(); psidx++) {
+                        uint32_t prev_st_pos = st_pos - 1;
+                        uint32_t prev_st = get_state_idx(prev_st_pos, prev_states_st[psidx].st_conv);
+                        uint8_t msg_shift = prev_states_st[psidx].msg_shift;
+                        uint8_t msg_newbits = prev_states_st[psidx].msg_newbits;
+                        uint8_t new_base = prev_states_st[psidx].new_base;
+                        uint8_t offset_adjusted_base = (new_base + offset[prev_st_pos]) % 4;
+                        for (uint32_t i = 0; i < list_size; i++) {
+                            if (prev_best_paths[prev_st][i].score == -INF)
+                                break;
+                            bitset_t msg = prev_best_paths[prev_st][i].msg;
+                            msg = (msg << msg_shift) | bitset_t(msg_newbits);
+                            float new_score_blank = -INF;
+                            float new_score_nonblank;
+                            total_score_computations ++;
+                            //if(st_pos == 1)
+                            //  std::cout << "t - 1 = " << (st_pos - 1) << ", cb + ob = " << int2base[new_base] << " + " << int2base[offset[prev_st_pos]] << " = " << int2base[offset_adjusted_base] << "\n";
+
+                            if (new_base != prev_best_paths[prev_st][i].last_base) {
+                                new_score_nonblank =
+                                  logsumexpf(prev_best_paths[prev_st][i].score_blank + post[t][offset_adjusted_base],//[new_base],
+                                           prev_best_paths[prev_st][i].score_nonblank + post[t][offset_adjusted_base]);//[new_base]);
+                            } else {
+                                // the newly added base is same as last base so we can't have the
+                                // thing ending with non_blank (otherwise it gets collapsed)
+                                new_score_nonblank = prev_best_paths[prev_st][i].score_blank + post[t][offset_adjusted_base];//[new_base];
+                            }
+                            if (new_score_nonblank == -INF)
+                            {
+                                continue;
+                                // overall score is -INF (this might happen if
+                                // score_blank for previous path is -INF and we are
+                                // in second case above)
+                            }
+
+                            // now check if this is already present in the stay transitions.
+                            // first try to match the new_base for speed, then look at full msg.
+                            // if already present, update the nonblank score
+                            bool match_found = false;
+                            for (uint32_t j = 0; j < num_stay_candidates; j++) {
+                                if (new_base == candidate_paths[j].last_base) {
+                                    if (msg == candidate_paths[j].msg) {
+                                        match_found = true;
+                                        candidate_paths[j].score_nonblank =
+                                                logsumexpf(candidate_paths[j].score_nonblank,new_score_nonblank);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!match_found) {
+                                candidate_paths.emplace_back(msg,new_score_nonblank,new_score_blank,new_base);
+                            }
+                        }
+                    }
+                }
+
+                uint32_t num_candidates = candidate_paths.size();
+                // update scores based on score_blank and score_nonblank
+                for (uint32_t i = 0; i < num_candidates; i++)
+                    candidate_paths[i].compute_score();
+
+                auto num_candidates_to_keep = std::min(list_size, num_candidates);
+                // use nth_element to to do partial sorting if num_candidates_to_keep < num_candidates
+                if (num_candidates_to_keep < num_candidates && num_candidates_to_keep > 0)
+                    std::nth_element(candidate_paths.begin(),
+                                   candidate_paths.begin()+num_candidates_to_keep-1,
+                                   candidate_paths.end(),
+                                   LVA_path_t_compare);
+                // copy over top candidate paths to curr_best
+                std::copy(candidate_paths.begin(),candidate_paths.begin()+num_candidates_to_keep,
+                            curr_best_paths[st]);
+                // fill any remaining positions in list with score -INF so they are not used later
+                for (uint32_t i = num_candidates_to_keep; i < list_size; i++)
+                    curr_best_paths[st][i].score = -INF;
+              }
+        }
+    }
+
+    uint32_t st_pos = nstate_pos - 1, st_conv = final_state_conv;  // last state
+    LVA_path_t *LVA_path_list_final = curr_best_paths[get_state_idx(st_pos, st_conv)];
+
+    // sort in decreasing order by score
+    // NOTE: the curr_best_paths list is not sorted since we use nth_element partial sorting
+    std::sort(LVA_path_list_final, LVA_path_list_final+list_size, LVA_path_t_compare);
+
+    std::vector<std::vector<bool>> decoded_msg_list;
+
+      // now convert bitset to bool vectors
+      for (uint32_t list_pos = 0; list_pos < list_size; list_pos++) {
+        std::vector<bool> decoded_msg(msg_len);
+        for (uint8_t i = 0; i < msg_len; i++)
+          decoded_msg[i] =
+              LVA_path_list_final[list_pos].msg[msg_len + mem_conv - 1 -
+                           i];  // due to way bitset is stored in reverse
+        if (rc_flag) std::reverse(decoded_msg.begin(), decoded_msg.end());
+        decoded_msg_list.push_back(decoded_msg);
+        // =============== FOR DEBUGGING ===============
+        //std::cout << "score: " << LVA_path_list_final[list_pos].score << "\n";
+        //for (auto b : decoded_msg_list.back()) std::cout << b;
+        //std::cout << "\n\n";
+        // ===============================================
+      }
+      // std::cout << "Final list size: " << decoded_msg_list.size() << "\n";
+
+      for (uint32_t i = 0; i < nstate_total; i++) {
+        delete[] curr_best_paths[i];
+        delete[] prev_best_paths[i];
+      }
+      delete[] curr_best_paths;
+      delete[] prev_best_paths;
+
+      // Log complexity if filename provided
+      double avg_steps = (double) total_score_computations.load() / (double) nblk;
+      if (!complexity_log_file.empty()) {
+        std::ofstream log_file(complexity_log_file, std::ios::app);
+        if (log_file.is_open()) {
+            log_file << nblk << " " << total_score_computations.load() << " " << avg_steps << "\n";
+            log_file.close();
+        }
+      }
+
+      return decoded_msg_list;
+}
+
+
 
 std::vector<prev_state_info_t> find_prev_states(const uint32_t &st2_conv,
                                                 const uint8_t &punc_pattern) {
