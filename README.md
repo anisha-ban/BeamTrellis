@@ -39,21 +39,25 @@ Usage of these scripts can be found in xxxxxxxxxxx
 
 ## How new FAST5 datasets are accommodated
 
-To simulate our decoding algorithm Synde on other FAST5 datasets, say for an error correction code $C \in {0,1,2,3}^m$, we adopt the following approach.
+To simulate our decoding algorithm Synde on other FAST5 datasets, say for an error correction code $C \in `\{0,1,2,3\}`^m$, we adopt the following approach.
 (We assume the presence of primer sequences, each of 25 nucleotides, on either side of the payload)
 
 1.  A given raw read is first basecalled, and the resulting sequence is matched to the causal reference sequence by utilizing alignment tools such as SAMtools [4, 5]. If the read is reverse-completeded, or has a secondary or a chimeric alignment, it is ignored (see [4] for details).
 2.   Following this, the part of the reference that is expressed in the raw read, say $y \in \{A,C,G,T\}^z$ is extracted. If $z<2 \cdot 25 + m$, then the process is aborted. We do so since such a read cannot accommodate two primer sequences and a DNA codeword of $130$ symbols.
-3.  Next, we choose an index $i \in \{0,1,...,z-50-m\}$ uniformly at random, and set the two primer sequences as $v^{(1)}=y_{i+1}^{i+25}$ and $v^{(2)}=y_{i+m+26}^{i+m+50}$, while the payload is assumed to be $x=y_{i+26}^{i+m+25}$.
+3.  Next, we choose an index $i \in `\{0,1,...,z-50-m\}`$ uniformly at random, and set the two primer sequences as $v^{(1)}=y_{i+1}^{i+25}$ and $v^{(2)}=y_{i+m+26}^{i+m+50}$, while the payload is assumed to be $x=y_{i+26}^{i+m+25}$.
 4.  A random codeword $u \in C$ is drawn from the chosen error-correction scheme, and the offset with respect to the true payload, say $o$, is computed as $o = f^{-1}(x) - u \pmod{4}$.
-5.  Our decoding pipeline is then provided the two primers $v^{(1)}, v^{(2)}$ and the computed offset $o$: \ps~searches for the leading primer $v^{(1)}$ and the estimate of the starting position of $v^{(1)}$ in the raw read that \ps~produces, is leveraged by \syndec~to initiate decoding on the corresponding syndrome trellis, while incorporating the offset $o$ appropriately.
+5.  Our decoding pipeline is then provided the two primers $v^{(1)}, v^{(2)}$ and the computed offset $o$: PrimerSeeker searches for the leading primer $v^{(1)}$ and the estimate of the starting position of $v^{(1)}$ in the raw read that PrimerSeeker produces, is leveraged by \syndec~to initiate decoding on the corresponding syndrome trellis, while incorporating the offset $o$ appropriately.
 6.  If the decoder fails to produce a codeword sequence of the requisite length $m$, an erasure is declared. Otherwise, if the decoded codeword, say $x' \in C$, does exactly matches the initial codeword $u$, the decoder is said to have worked correctly. Else, a frame error is declared.
 
 
 
 # References
 [1] S. Chandak et al., “Overcoming High Nanopore Basecaller Error Rates for DNA Storage via Basecaller-Decoder Integration and Convolutional Codes,” in ICASSP 2020 - 2020 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), May 2020, pp. 8822–8826. doi: 10.1109/ICASSP40776.2020.9053441.
+
 [2] B. Lau et al., “Magnetic DNA random access memory with nanopore readouts and exponentially-scaled combinatorial addressing,” Sci Rep, vol. 13, no. 8514, Art. no. 1, May 2023, doi: 10.1038/s41598-023-29575-z.
+
 [3] A. Banerjee et al., ............
+
 [4] H. Li et al., “The Sequence Alignment/Map format and SAMtools,” Bioinformatics, vol. 25, no. 16, pp. 2078–2079, Aug. 2009, doi: 10.1093/bioinformatics/btp352.
+
 [5] P. Danecek et al., “Twelve years of SAMtools and BCFtools,” Gigascience, vol. 10, no. 2, p. giab008, Feb. 2021, doi: 10.1093/gigascience/giab008.
