@@ -35,7 +35,7 @@ cd BeamTrellis/
     - `add_stanford_primer_positions.py` (is this used or integrated into synde_generate_sim_targets?)
     - `my_utils.py`: contains helper functions for the aforementioned new scripts
 
-Usage of these scripts can be found in xxxxxxxxxxx
+Usage of these scripts can be found in `scripts` folder of this [Git repo](https://github.com/anisha-ban/decoding-raw-nanopore-signals-dna-storage).
 
 ## How new FAST5 datasets are accommodated
 
@@ -56,7 +56,8 @@ To simulate our decoding algorithm Synde on other FAST5 datasets, say for an err
 
 [2] B. Lau et al., “Magnetic DNA random access memory with nanopore readouts and exponentially-scaled combinatorial addressing,” Sci Rep, vol. 13, no. 8514, Art. no. 1, May 2023, doi: 10.1038/s41598-023-29575-z.
 
-[3] A. Banerjee et al., ............
+[3] A. Banerjee, R. Sokolovskii, T. Heinis, A. Wachter-Zeh, E. Rosnes, and A. G. i Amat, “SynDe: Syndrome-guided Decoding of Raw Nanopore Reads,” 2026, arXiv. doi: 10.48550/ARXIV.2604.01054.
+
 
 [4] H. Li et al., “The Sequence Alignment/Map format and SAMtools,” Bioinformatics, vol. 25, no. 16, pp. 2078–2079, Aug. 2009, doi: 10.1093/bioinformatics/btp352.
 
